@@ -22,7 +22,7 @@ users_googleauth-pam-{{ svc }}-{{ name }}:
   file.replace:
     - name: /etc/pam.d/{{ svc }}
     - pattern: "^@include common-auth"
-    - repl: "auth       [success=done new_authtok_reqd=done default=die]   pam_google_authenticator.so user=root secret={{ users.googleauth_dir }}/${USER}_{{ svc }} echo_verification_code\n@include common-auth"
+    - repl: "auth       required     pam_google_authenticator.so user=root secret={{ users.googleauth_dir }}/${USER}_{{ svc }} echo_verification_code\n@include common-auth"
     - unless: grep pam_google_authenticator.so /etc/pam.d/{{ svc }}
     - backup: .bak
 {%- endif %}
