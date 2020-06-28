@@ -3,12 +3,33 @@
 {% set used_sudo = [] %}
 {% set used_googleauth = [] %}
 {% set used_user_files = [] %}
+{% set used_polkit = [] %}
+
+{% for group, setting in salt['pillar.get']('groups', {}).items() %}
+{%   if setting.absent is defined and setting.absent or setting.get('state', "present") == 'absent' %}
+users_group_absent_{{ group }}:
+  group.absent:
+    - name: {{ group }}
+{% else %}
+users_group_present_{{ group }}:
+  group.present:
+    - name: {{ group }}
+    - gid: {{ setting.get('gid', "null") }}
+    - system: {{ setting.get('system',"False") }}
+    - members: {{ setting.get('members')|json }}
+    - addusers: {{ setting.get('addusers')|json }}
+    - delusers: {{ setting.get('delusers')|json }}
+{% endif %}
+{% endfor %}
 
 {%- for name, user in pillar.get('users', {}).items()
         if user.absent is not defined or not user.absent %}
 {%- if user == None -%}
 {%- set user = {} -%}
 {%- endif -%}
+{%- if 'sudoonly' in user and user['sudoonly'] %}
+{%- set _dummy=user.update({'sudouser': True}) %}
+{%- endif %}
 {%- if 'sudouser' in user and user['sudouser'] %}
 {%- do used_sudo.append(1) %}
 {%- endif %}
@@ -18,9 +39,12 @@
 {%- if salt['pillar.get']('users:' ~ name ~ ':user_files:enabled', False) %}
 {%- do used_user_files.append(1) %}
 {%- endif %}
+{%- if user.get('polkitadmin', False) == True %}
+{%- do used_polkit.append(1)  %}
+{%- endif %}
 {%- endfor %}
 
-{%- if used_sudo or used_googleauth or used_user_files %}
+{%- if used_sudo or used_googleauth or used_user_files or used_polkit %}
 include:
 {%- if used_sudo %}
   - users.sudo
@@ -31,6 +55,9 @@ include:
 {%- if used_user_files %}
   - users.user_files
 {%- endif %}
+{%- if used_polkit %}
+  - users.polkit
+{%- endif %}
 {%- endif %}
 
 {% for name, user in pillar.get('users', {}).items()
@@ -40,6 +67,7 @@ include:
 {%- endif -%}
 {%- set current = salt.user.info(name) -%}
 {%- set home = user.get('home', current.get('home', "/home/%s" % name)) -%}
+{%- set createhome = user.get('createhome', users.get('createhome')) -%}
 
 {%- if 'prime_group' in user and 'name' in user['prime_group'] %}
 {%- set user_group = user.prime_group.name -%}
@@ -47,6 +75,7 @@ include:
 {%- set user_group = name -%}
 {%- endif %}
 
+{%- if not ( 'sudoonly' in user and user['sudoonly'] ) %}
 {% for group in user.get('groups', []) %}
 users_{{ name }}_{{ group }}_group:
   group.present:
@@ -56,13 +85,24 @@ users_{{ name }}_{{ group }}_group:
     {% endif %}
 {% endfor %}
 
+{# in case home subfolder doesn't exist, create it before the user exists #}
+{% if createhome -%}
+users_{{ name }}_user_prereq:
+  file.directory:
+    - name: {{ salt['file.dirname'](home) }}
+    - makedirs: True
+    - prereq:
+      - user: users_{{ name }}_user
+{%- endif %}
+
 users_{{ name }}_user:
-  {% if user.get('createhome', True) %}
+  {% if createhome -%}
   file.directory:
     - name: {{ home }}
     - user: {{ user.get('homedir_owner', name) }}
     - group: {{ user.get('homedir_group', user_group) }}
     - mode: {{ user.get('user_dir_mode', '0750') }}
+    - makedirs: True
     - require:
       - user: users_{{ name }}_user
       - group: {{ user_group }}
@@ -101,8 +141,10 @@ users_{{ name }}_user:
     {% endif -%}
     {% if 'prime_group' in user and 'gid' in user['prime_group'] -%}
     - gid: {{ user['prime_group']['gid'] }}
+    {% elif 'prime_group' in user and 'name' in user['prime_group'] %}
+    - gid: {{ user['prime_group']['name'] }}
     {% else -%}
-    - gid_from_name: True
+    - gid: {{ name }}
     {% endif -%}
     {% if 'fullname' in user %}
     - fullname: {{ user['fullname'] }}
@@ -114,11 +156,15 @@ users_{{ name }}_user:
     - workphone: {{ user['workphone'] }}
     {% endif %}
     {% if 'homephone' in user %}
-    - homephone: {{ user['workphone'] }}
+    - homephone: {{ user['homephone'] }}
     {% endif %}
-    {% if not user.get('createhome', True) %}
-    - createhome: False
+    - createhome: {{ createhome }}
+    {% if not user.get('unique', True) %}
+    - unique: False
     {% endif %}
+    {%- if grains['saltversioninfo'] >= [2018, 3, 1] %}
+    - allow_gid_change: {{ users.allow_gid_change if 'allow_gid_change' not in user else user['allow_gid_change'] }}
+    {%- endif %}
     {% if 'expire' in user -%}
         {% if grains['kernel'].endswith('BSD') and
             user['expire'] < 157766400 %}
@@ -127,11 +173,23 @@ users_{{ name }}_user:
         {% elif grains['kernel'] == 'Linux' and
             user['expire'] > 84006 %}
         {# 2932896 days since epoch equals 9999-12-31 #}
-    - expire: {{ (user['expire'] / 86400) | int}}
+    - expire: {{ (user['expire'] / 86400) | int }}
         {% else %}
     - expire: {{ user['expire'] }}
         {% endif %}
     {% endif -%}
+    {% if 'mindays' in user %}
+    - mindays: {{ user.get('mindays', None) }}
+    {% endif %}
+    {% if 'maxdays' in user %}
+    - maxdays: {{ user.get('maxdays', None) }}
+    {% endif %}
+    {% if 'inactdays' in user %}
+    - inactdays: {{ user.get('inactdays', None) }}
+    {% endif %}
+    {% if 'warndays' in user %}
+    - warndays: {{ user.get('warndays', None) }}
+    {% endif %}
     - remove_groups: {{ user.get('remove_groups', 'False') }}
     - groups:
       - {{ user_group }}
@@ -141,7 +199,7 @@ users_{{ name }}_user:
     {% if 'optional_groups' in user %}
     - optional_groups:
       {% for optional_group in user['optional_groups'] -%}
-      - {{optional_group}}
+      - {{ optional_group }}
       {% endfor %}
     {% endif %}
     - require:
@@ -164,6 +222,7 @@ user_keydir_{{ name }}:
     - group: {{ user_group }}
     - makedirs: True
     - mode: 700
+    - dir_mode: 700
     - require:
       - user: {{ name }}
       - group: {{ user_group }}
@@ -173,34 +232,39 @@ user_keydir_{{ name }}:
   {% endif %}
 
   {% if 'ssh_keys' in user %}
-  {% set key_type = 'id_' + user.get('ssh_key_type', 'rsa') %}
-users_user_{{ name }}_private_key:
+    {% for _key in user.ssh_keys.keys() %}
+      {% if _key == 'privkey' %}
+        {% set key_name = 'id_' + user.get('ssh_key_type', 'rsa') %}
+      {% elif _key ==  'pubkey' %}
+        {% set key_name = 'id_' + user.get('ssh_key_type', 'rsa') + '.pub' %}
+      {% else %}
+        {% set key_name = _key %}
+      {% endif %}
+users_{{ name }}_{{ key_name }}_key:
   file.managed:
-    - name: {{ home }}/.ssh/{{ key_type }}
+    - name: {{ home }}/.ssh/{{ key_name }}
     - user: {{ name }}
     - group: {{ user_group }}
-    - mode: 600
-    - show_diff: False
-    - contents_pillar: users:{{ name }}:ssh_keys:privkey
-    - require:
-      - user: users_{{ name }}_user
-      {% for group in user.get('groups', []) %}
-      - group: users_{{ name }}_{{ group }}_group
-      {% endfor %}
-users_user_{{ name }}_public_key:
-  file.managed:
-    - name: {{ home }}/.ssh/{{ key_type }}.pub
-    - user: {{ name }}
-    - group: {{ user_group }}
+      {% if key_name.endswith(".pub") %}
     - mode: 644
+      {% else %}
+    - mode: 600
+      {% endif %}
     - show_diff: False
-    - contents_pillar: users:{{ name }}:ssh_keys:pubkey
+    {%- set key_value = salt['pillar.get']('users:'+name+':ssh_keys:'+_key) %}
+    {%- if 'salt://' in key_value[:7] %}
+    - source: {{ key_value }}
+    {%- else %}
+    - contents_pillar: users:{{ name }}:ssh_keys:{{ _key }}
+    {%- endif %}
     - require:
       - user: users_{{ name }}_user
       {% for group in user.get('groups', []) %}
       - group: users_{{ name }}_{{ group }}_group
       {% endfor %}
+    {% endfor %}
   {% endif %}
+
 
 {% if 'ssh_auth_file' in user or 'ssh_auth_pillar' in user %}
 users_authorized_keys_{{ name }}:
@@ -215,8 +279,9 @@ users_authorized_keys_{{ name }}:
         {{ auth }}
         {% endfor -%}
 {% else %}
+    - contents: |
         {%- for key_name, pillar_name in user['ssh_auth_pillar'].items() %}
-    - contents_pillar: {{ pillar_name }}:{{ key_name }}:pubkey
+        {{ salt['pillar.get'](pillar_name + ':' + key_name + ':pubkey', '') }}
         {%- endfor %}
 {% endif %}
 {% endif %}
@@ -271,7 +336,23 @@ users_ssh_auth_source_{{ name }}_{{ loop.index0 }}:
     - user: {{ name }}
     - source: {{ pubkey_file }}
     - require:
+        {% if createhome -%}
         - file: users_{{ name }}_user
+        {% endif -%}
+        - user: users_{{ name }}_user
+{% endfor %}
+{% endif %}
+
+{% if 'ssh_auth_sources.absent' in user %}
+{% for pubkey_file in user['ssh_auth_sources.absent'] %}
+users_ssh_auth_source_delete_{{ name }}_{{ loop.index0 }}:
+  ssh_auth.absent:
+    - user: {{ name }}
+    - source: {{ pubkey_file }}
+    - require:
+        {% if createhome -%}
+        - file: users_{{ name }}_user
+        {% endif -%}
         - user: users_{{ name }}_user
 {% endfor %}
 {% endif %}
@@ -283,7 +364,9 @@ users_ssh_auth_delete_{{ name }}_{{ loop.index0 }}:
     - user: {{ name }}
     - name: {{ auth }}
     - require:
+        {% if createhome -%}
         - file: users_{{ name }}_user
+        {% endif -%}
         - user: users_{{ name }}_user
 {% endfor %}
 {% endif %}
@@ -325,8 +408,14 @@ users_ssh_known_hosts_{{ name }}_{{ loop.index0 }}:
     {% if 'enc' in host %}
     - enc: {{ host['enc'] }}
     {% endif -%}
-    {% if 'hash_hostname' in host %}
-    - hash_hostname: {{ host['hash_hostname'] }}
+    {% if 'hash_known_hosts' in host %}
+    - hash_known_hosts: {{ host['hash_known_hosts'] }}
+    {% endif -%}
+    {% if 'timeout' in host %}
+    - timeout: {{ host['timeout'] }}
+    {% endif -%}
+    {% if 'fingerprint_hash_type' in host %}
+    - fingerprint_hash_type: {{ host['fingerprint_hash_type'] }}
     {% endif -%}
 {% endfor %}
 {% endif %}
@@ -339,13 +428,15 @@ users_ssh_known_hosts_delete_{{ name }}_{{ loop.index0 }}:
     - name: {{ host }}
 {% endfor %}
 {% endif %}
+{% endif %}
 
+{% set sudoers_d_filename = name|replace('.','_') %}
 {% if 'sudouser' in user and user['sudouser'] %}
 
 users_sudoer-{{ name }}:
   file.managed:
     - replace: False
-    - name: {{ users.sudoers_dir }}/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ sudoers_d_filename }}
     - user: root
     - group: {{ users.root_group }}
     - mode: '0440'
@@ -384,7 +475,7 @@ users_sudoer-{{ name }}:
 users_{{ users.sudoers_dir }}/{{ name }}:
   file.managed:
     - replace: True
-    - name: {{ users.sudoers_dir }}/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ sudoers_d_filename }}
     - contents: |
       {%- if 'sudo_defaults' in user %}
       {%- for entry in user['sudo_defaults'] %}
@@ -405,18 +496,19 @@ users_{{ users.sudoers_dir }}/{{ name }}:
       - file: users_sudoer-defaults
       - file: users_sudoer-{{ name }}
   cmd.wait:
-    - name: visudo -cf {{ users.sudoers_dir }}/{{ name }} || ( rm -rvf {{ users.sudoers_dir }}/{{ name }}; exit 1 )
+    - name: visudo -cf {{ users.sudoers_dir }}/{{ sudoers_d_filename }} || ( rm -rvf {{ users.sudoers_dir }}/{{ sudoers_d_filename }}; exit 1 )
     - watch:
-      - file: {{ users.sudoers_dir }}/{{ name }}
+      - file: {{ users.sudoers_dir }}/{{ sudoers_d_filename }}
 {% endif %}
 {% else %}
-users_{{ users.sudoers_dir }}/{{ name }}:
+users_{{ users.sudoers_dir }}/{{ sudoers_d_filename }}:
   file.absent:
-    - name: {{ users.sudoers_dir }}/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ sudoers_d_filename }}
 {% endif %}
 
-{%- if 'google_auth' in user %}
-{%- for svc in user['google_auth'] %}
+{%- if not grains['os_family'] in ['RedHat', 'Suse'] %}
+{%-   if 'google_auth' in user %}
+{%-     for svc in user['google_auth'] %}
 users_googleauth-{{ svc }}-{{ name }}:
   file.managed:
     - replace: false
@@ -427,13 +519,10 @@ users_googleauth-{{ svc }}-{{ name }}:
     - mode: 400
     - require:
       - pkg: users_googleauth-package
-{%- endfor %}
+{%-     endfor %}
+{%-   endif %}
 {%- endif %}
 
-#
-# if not salt['cmd.has_exec']('git')
-# fails even if git is installed
-#
 # this doesn't work (Salt bug), therefore need to run state.apply twice
 #include:
 #  - users
@@ -443,10 +532,12 @@ users_googleauth-{{ svc }}-{{ name }}:
 #    - require_in:
 #      - sls: users
 #
+{% if salt['cmd.has_exec']('git') %}
+
 {% if 'gitconfig' in user %}
 {% for key, value in user['gitconfig'].items() %}
 users_{{ name }}_user_gitconfig_{{ loop.index0 }}:
-  {% if grains['saltversioninfo'] >= (2015, 8, 0, 0) %}
+  {% if grains['saltversioninfo'] >= [2015, 8, 0, 0] %}
   git.config_set:
   {% else %}
   git.config:
@@ -454,12 +545,25 @@ users_{{ name }}_user_gitconfig_{{ loop.index0 }}:
     - name: {{ key }}
     - value: "{{ value }}"
     - user: {{ name }}
-    {% if grains['saltversioninfo'] >= (2015, 8, 0, 0) %}
+    {% if grains['saltversioninfo'] >= [2015, 8, 0, 0] %}
     - global: True
     {% else %}
     - is_global: True
     {% endif %}
 {% endfor %}
+{% endif %}
+
+{% if 'gitconfig.absent' in user and grains['saltversioninfo'] >= [2015, 8, 0, 0] %}
+{% for key in user.get('gitconfig.absent') %}
+users_{{ name }}_user_gitconfig_absent_{{ key }}:
+  git.config_unset:
+    - name: '{{ key }}'
+    - user: {{ name }}
+    - global: True
+    - all: True
+{% endfor %}
+{% endif %}
+
 {% endif %}
 
 {% endfor %}
